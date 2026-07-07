@@ -35,6 +35,16 @@ drink_data = {
     "abv": [4.2, 20.0, 12.0, 6.0, 32.0]
 }
 
+def drink_rec(gender, age, is_smiling, timestamp):
+    if gender == "Male" and age in ['(15-20)', '(25-32)'] and is_smiling:
+        return "Light Beer"
+    elif gender == "Female" and age in ['(25-32)', '(38-43)'] and is_smiling:
+        return "Soju"
+    else :
+        return "Wine"
+    # Placeholder implementation - replace with actual drink recommendation logic
+    
+
 @app.route('/process-frame', methods=['POST'])
 def process_frame():
     data = request.json.get('frame')
@@ -44,11 +54,8 @@ def process_frame():
     img_bytes = base64.b64decode(encoded)
     np_arr = np.frombuffer(img_bytes, np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    # Add timestamp
     
     now = datetime.datetime.now().strftime("%m/%d/%Y %H:%M:%S")
-    #cv2.putText(frame, now, (10, 50), cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 255), 2)
     
     # Face detection
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -62,7 +69,21 @@ def process_frame():
         radius = int(max(w, h) / 2 * 1.2)
         cv2.circle(frame, center, radius, (0, 0, 255), 3)
 
-        # Crop face with a little padding, clamped to frame bounds
+        # Separate grayscale region just for this specific face to search for a smile
+        roi_gray = gray[y:y+h, x:x+w]
+        roi_color = frame[y:y+h, x:x+w]
+        
+        # Smile detection parameters optimized for face sub-regions:
+        # minNeighbors=20+ avoids false-positive twitch detections
+        smiles = smile_cascade.detectMultiScale(roi_gray, scaleFactor=1.7, minNeighbors=22)
+        
+        is_smiling = False
+        for (sx, sy, sw, sh) in smiles:
+            # Draw a green rectangle around the mouth inside the face region
+            cv2.rectangle(roi_color, (sx, sy), (sx + sw, sy + sh), (0, 255, 255), 2)
+            is_smiling = True
+
+        # Crop face with a little padding for DNN processing, clamped to frame bounds
         pad = int(0.05 * h)
         y1 = max(0, y - pad)
         y2 = min(frame_h, y + h + pad)
@@ -91,20 +112,24 @@ def process_frame():
         age = AGE_BUCKETS[age_preds[0].argmax()]
         age_confidence = float(age_preds[0].max())
 
-        # Draw label above the detected face
-        label = f"{gender}, {age}"
+        # Update text label overlay to include expression status
+        mood_text = "Smiling" if is_smiling else "Neutral"
+        label = f"{gender}, {age} ({mood_text})"
         label_y = max(0, y1 - 10)
         cv2.putText(
             frame, label, (x1, label_y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
         )
 
+
         results.append({
             'box': {'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h)},
             'gender': gender,
             'gender_confidence': gender_confidence,
             'age': age,
-            'age_confidence': age_confidence
+            'age_confidence': age_confidence,
+            'is_smiling': is_smiling,
+            'drink_rec': drink_rec(gender, age, is_smiling, now)
         })
 
     # Re-encode and send back
