@@ -1,6 +1,38 @@
 import { useEffect, useRef, useState } from "react";
 
-const BACKEND_URL = "http://localhost:5000/process-frame";
+const BACKEND = "http://localhost:5000";
+const BACKEND_URL = `${BACKEND}/process-frame`;
+
+// How many recent frames to vote over when logging an order
+const HISTORY_FRAMES = 6;
+
+function mostCommon(values) {
+  const counts = {};
+  values.forEach((v) => (counts[v] = (counts[v] || 0) + 1));
+  return Object.keys(counts).reduce((a, b) => (counts[a] >= counts[b] ? a : b));
+}
+
+function average(values) {
+  return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+// Single frames flicker, so combine the last few detections of the patron
+function stablePatron(history) {
+  if (history.length === 0) return null;
+  return {
+    gender: mostCommon(history.map((r) => r.gender)),
+    age: mostCommon(history.map((r) => r.age)),
+    is_smiling: history.filter((r) => r.is_smiling).length * 2 > history.length,
+    gender_confidence: average(history.map((r) => r.gender_confidence)),
+    age_confidence: average(history.map((r) => r.age_confidence)),
+    faces_detected: Math.round(average(history.map((r) => r.faces_detected))),
+  };
+}
+
+// The biggest face is the person closest to the bar
+function largestFace(results) {
+  return results.reduce((a, b) => (a.box.w * a.box.h >= b.box.w * b.box.h ? a : b));
+}
 
 export default function App() {
   const videoRef = useRef(null);
@@ -10,6 +42,17 @@ export default function App() {
   const [facesDetected, setFacesDetected] = useState(0);
   const [results, setResults] = useState([]);
   const inFlightRef = useRef(false);
+  const historyRef = useRef([]);
+  const [drinks, setDrinks] = useState([]);
+  const [logStatus, setLogStatus] = useState(null);
+  const [ordersLogged, setOrdersLogged] = useState(0);
+
+  useEffect(() => {
+    fetch(`${BACKEND}/drinks`)
+      .then((res) => res.json())
+      .then((data) => setDrinks(data.drinks))
+      .catch((err) => console.error("Failed to load drinks:", err));
+  }, []);
 
   useEffect(() => {
     let stream;
@@ -66,6 +109,12 @@ export default function App() {
         setProcessedFrame(result.frame);
         setFacesDetected(result.faces_detected);
         setResults(result.results || []);
+        if (result.results && result.results.length > 0) {
+          const patron = { ...largestFace(result.results), faces_detected: result.faces_detected };
+          historyRef.current = [...historyRef.current, patron].slice(-HISTORY_FRAMES);
+        } else {
+          historyRef.current = [];
+        }
       } catch (err) {
         console.error("Failed to process frame:", err);
       } finally {
@@ -76,7 +125,29 @@ export default function App() {
     return () => clearInterval(interval);
   }, [error]);
 
-  const activeRecommendation = results.length > 0 ? results[0].drink_rec : null;
+  const activeRecommendation = results.length > 0 ? largestFace(results).drink_rec : null;
+  const topRecs = results.length > 0 ? largestFace(results).drink_recs || [] : [];
+
+  async function logOrder(drink) {
+    const patron = stablePatron(historyRef.current);
+    if (!patron) {
+      setLogStatus("No face in view - order not logged.");
+      return;
+    }
+    try {
+      const res = await fetch(`${BACKEND}/log-order`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...patron, drink }),
+      });
+      if (!res.ok) throw new Error(`Backend responded ${res.status}`);
+      setOrdersLogged((n) => n + 1);
+      setLogStatus(`Logged ${drink} for ${patron.gender}, ${patron.age}`);
+    } catch (err) {
+      console.error("Failed to log order:", err);
+      setLogStatus("Failed to log order - is the backend running?");
+    }
+  }
 
   return (
     <div style={styles.page}>
@@ -98,6 +169,38 @@ export default function App() {
               {activeRecommendation ? `${activeRecommendation} Preview` : "Beverage Image Preview"}
             </span>
           </div>
+
+          {topRecs.length > 1 && (
+            <div style={styles.topRecs}>
+              {topRecs.map((rec) => (
+                <div key={rec.drink}>
+                  {rec.drink} &mdash; {(rec.probability * 100).toFixed(0)}%
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Order logging: record what the patron actually ordered, for training */}
+        <div style={styles.metricsCard}>
+          <h3 style={styles.metricsHeading}>What did they order?</h3>
+          <div style={styles.drinkButtons}>
+            {drinks.map((drink) => (
+              <button
+                key={drink}
+                style={styles.drinkButton}
+                disabled={results.length === 0}
+                onClick={() => logOrder(drink)}
+              >
+                {drink}
+              </button>
+            ))}
+          </div>
+          {logStatus && (
+            <p style={styles.logStatus}>
+              {logStatus} ({ordersLogged} logged this session)
+            </p>
+          )}
         </div>
 
         {/* Analytics Breakdown Panel */}
@@ -228,6 +331,35 @@ const styles = {
     color: "#4e5d6c",
     fontSize: "0.95rem",
     fontWeight: "500",
+  },
+  topRecs: {
+    marginTop: "1rem",
+    fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
+    fontSize: "0.95rem",
+    color: "#4e5d6c",
+    textAlign: "center",
+    lineHeight: 1.6,
+  },
+  drinkButtons: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "0.5rem",
+  },
+  drinkButton: {
+    fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
+    fontSize: "0.95rem",
+    color: "#4e5d6c",
+    background: "#f6e6b8",
+    border: "2px solid #e3d264",
+    borderRadius: "8px",
+    padding: "0.5rem 0.9rem",
+    cursor: "pointer",
+  },
+  logStatus: {
+    margin: "0.75rem 0 0 0",
+    fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
+    fontSize: "0.9rem",
+    color: "#4e5d6c",
   },
   metricsCard: {
     background: "#dedbd8", // Super soft retro pastel blue-grey tint

@@ -3,8 +3,14 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64
+import csv
 import datetime
+import os
+
+import joblib
 import pandas as pd
+
+from features import AGE_BUCKETS, DRINKS, GENDER_LIST, ORDER_COLUMNS, encode
 
 app = Flask(__name__)
 CORS(app)
@@ -16,34 +22,77 @@ smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile
 GENDER_PROTO = 'deploy_gender2.prototxt'
 GENDER_MODEL = 'gender_net.caffemodel'
 gender_net = cv2.dnn.readNetFromCaffe(GENDER_PROTO, GENDER_MODEL)
-GENDER_LIST = ['Male', 'Female']
 
 # Load age detection model
 AGE_PROTO = 'deploy_age2.prototxt'
 AGE_MODEL = 'age_net.caffemodel'
 age_net = cv2.dnn.readNetFromCaffe(AGE_PROTO, AGE_MODEL)
-AGE_BUCKETS = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
 
 print("Models loaded successfully.")
 
 MODEL_MEAN_VALUES = (78.4263377603, 87.7689143744, 114.895847746)
 
-drink_data = {
-    "drink_name": ["Light Beer", "Soju", "Wine", "Hard Cider", "Old Fashioned"],
-    "recommended_age_group": [2, 3, 4, 2, 4],
-    "preferred_gender": ["Male", "Any", "Female", "Female", "Male"],
-    "abv": [4.2, 20.0, 12.0, 6.0, 32.0]
-}
+ORDERS_CSV = 'orders.csv'
+MODEL_PATH = 'drink_model.joblib'
 
-def drink_rec(gender, age, is_smiling, timestamp):
+# Trained by train.py; until then fall back to the hand-written rules
+drink_model = joblib.load(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
+print("Loaded trained drink model." if drink_model else "No trained drink model, using rules.")
+
+
+def rule_based_rec(gender, age, is_smiling):
     if gender == "Male" and age in ['(15-20)', '(25-32)'] and is_smiling:
         return "Light Beer"
     elif gender == "Female" and age in ['(25-32)', '(38-43)'] and is_smiling:
         return "Soju"
-    else :
+    else:
         return "Wine"
-    # Placeholder implementation - replace with actual drink recommendation logic
-    
+
+
+def drink_rec(gender, age, is_smiling, dt):
+    """Return the top 3 drinks as [{'drink', 'probability'}], best first."""
+    if drink_model is None:
+        return [{'drink': rule_based_rec(gender, age, is_smiling), 'probability': None}]
+
+    model, columns = drink_model['model'], drink_model['columns']
+    features = encode(gender, age, is_smiling, dt)
+    probs = model.predict_proba([[features[c] for c in columns]])[0]
+    top = probs.argsort()[::-1][:3]
+    return [{'drink': str(model.classes_[i]), 'probability': float(probs[i])} for i in top]
+
+
+@app.route('/drinks', methods=['GET'])
+def drinks():
+    return jsonify({'drinks': DRINKS})
+
+
+@app.route('/log-order', methods=['POST'])
+def log_order():
+    """Save one patron's detected features plus what they actually ordered."""
+    order = request.json or {}
+    if order.get('drink') not in DRINKS:
+        return jsonify({'error': f"drink must be one of {DRINKS}"}), 400
+    if order.get('gender') not in GENDER_LIST or order.get('age') not in AGE_BUCKETS:
+        return jsonify({'error': 'missing or unknown gender/age'}), 400
+
+    row = {
+        'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+        'gender': order['gender'],
+        'gender_confidence': float(order.get('gender_confidence', 0)),
+        'age': order['age'],
+        'age_confidence': float(order.get('age_confidence', 0)),
+        'is_smiling': int(bool(order.get('is_smiling'))),
+        'faces_detected': int(order.get('faces_detected', 1)),
+        'drink': order['drink'],
+    }
+    is_new = not os.path.exists(ORDERS_CSV)
+    with open(ORDERS_CSV, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=ORDER_COLUMNS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+    return jsonify({'logged': row})
+
 
 @app.route('/process-frame', methods=['POST'])
 def process_frame():
@@ -55,7 +104,8 @@ def process_frame():
     np_arr = np.frombuffer(img_bytes, np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     
-    now = datetime.datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    now_dt = datetime.datetime.now()
+    now = now_dt.strftime("%m/%d/%Y %H:%M:%S")
     
     # Face detection
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -122,6 +172,7 @@ def process_frame():
         )
 
 
+        recs = drink_rec(gender, age, is_smiling, now_dt)
         results.append({
             'box': {'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h)},
             'gender': gender,
@@ -129,7 +180,8 @@ def process_frame():
             'age': age,
             'age_confidence': age_confidence,
             'is_smiling': is_smiling,
-            'drink_rec': drink_rec(gender, age, is_smiling, now)
+            'drink_rec': recs[0]['drink'],
+            'drink_recs': recs,
         })
 
     # Re-encode and send back

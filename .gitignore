@@ -37,3 +37,7 @@ node_modules/
 
 .env.local
 .env.*.local
+
+# Patron data and trained model (personal data, keep out of git)
+backend/orders.csv
+backend/drink_model.joblib
